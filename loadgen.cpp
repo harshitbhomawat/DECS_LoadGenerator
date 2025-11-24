@@ -3,177 +3,173 @@
 #include <vector>
 #include <atomic>
 #include <chrono>
-#include <random>
 #include <string>
-#include <mutex>
+#include <random>
+#include <unordered_map>
 #include "httplib.h"
 
 using namespace std;
 using namespace chrono;
 
-enum Workload {
+enum class Workload {
     PUT_ALL,
     GET_ALL,
     POPULAR_GET,
     MIXED
 };
 
-string generate_random_value(int len = 10) {
-    static const char chars[] =
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+Workload parse_workload(const string &s) {
+    if (s == "putall") return Workload::PUT_ALL;
+    if (s == "getall") return Workload::GET_ALL;
+    if (s == "getpopular") return Workload::POPULAR_GET;
+    if (s == "mixed") return Workload::MIXED;
 
-    static thread_local mt19937 rng(random_device{}());
-    uniform_int_distribution<int> dist(0, sizeof(chars) - 2);
-
-    string s;
-    for (int i = 0; i < len; i++) s.push_back(chars[dist(rng)]);
-    return s;
+    cerr << "Invalid workload: " << s << endl;
+    exit(1);
 }
 
-void client_thread_func(
+string make_key(int k) { return "key" + to_string(k); }
+string make_value(int v) { return "value" + to_string(v); }
+
+void perclientfunction(
     int id,
     Workload workload,
     int duration_sec,
-    atomic<long long> &total_requests,
+    atomic<long long> &total_req,
     atomic<long long> &total_latency_ns,
-    const string &server_host,
-    int server_port
+    const string &host,
+    int port
 ) {
-    httplib::Client cli(server_host, server_port);
+    httplib::Client cli(host, port);
     cli.set_keep_alive(true);
 
-    auto end_time = steady_clock::now() + seconds(duration_sec);
+    auto stop_time = steady_clock::now() + seconds(duration_sec);
 
-    long long local_count = 0;
-    long long local_latency = 0;
+    long long local_req = 0;
+    long long local_lat = 0;
 
-    static vector<string> popular_keys = {"k1", "k2", "k3", "k4", "k5"};
-
-    mt19937 rng(id + time(NULL));
-    uniform_int_distribution<int> key_dist(1, 500000);
-    uniform_int_distribution<int> pop_dist(0, popular_keys.size() - 1);
+    mt19937 rng(id + 12345);
+    uniform_int_distribution<int> key_dist(1, 50000);
+    uniform_int_distribution<int> popular_dist(1, 5);
     uniform_int_distribution<int> mix_dist(0, 2);
 
-    while (steady_clock::now() < end_time) {
-        string key = "k" + to_string(key_dist(rng));
-        string value = generate_random_value(12);
-
-        bool success = false;
+    while (steady_clock::now() < stop_time) {
+        int k = key_dist(rng);
+        string key = make_key(k);
+        string value = make_value(k);
 
         auto start = steady_clock::now();
+        bool ok = false;
 
         switch (workload) {
-            case PUT_ALL: {
+            case Workload::PUT_ALL: {
                 string body = "key=" + key + "&value=" + value;
                 auto res = cli.Post("/create", body, "application/x-www-form-urlencoded");
-                success = (res && res->status == 200);
+                ok = res && res->status == 200;
                 break;
             }
-
-            case GET_ALL: {
+            case Workload::GET_ALL: {
                 auto res = cli.Get(("/read?key=" + key).c_str());
-                success = (res && res->status == 200);
+                ok = res && res->status == 200;
                 break;
             }
-
-            case POPULAR_GET: {
-                string hot_key = popular_keys[pop_dist(rng)];
-                auto res = cli.Get(("/read?key=" + hot_key).c_str());
-                success = (res && res->status == 200);
+            case Workload::POPULAR_GET: {
+                int pk = popular_dist(rng);
+                string pop_key = make_key(pk);
+                auto res = cli.Get(("/read?key=" + pop_key).c_str());
+                ok = res && res->status == 200;
                 break;
             }
-
-            case MIXED: {
+            case Workload::MIXED: {
                 int r = mix_dist(rng);
-
-                if (r == 0) {  // PUT
+                if (r == 0) {
                     string body = "key=" + key + "&value=" + value;
                     auto res = cli.Post("/create", body, "application/x-www-form-urlencoded");
-                    success = (res && res->status == 200);
-                } else if (r == 1) {  // GET
+                    ok = res && res->status == 200;
+                } else if (r == 1) {
                     auto res = cli.Get(("/read?key=" + key).c_str());
-                    success = (res && res->status == 200);
-                } else {  // DELETE
+                    ok = res && res->status == 200;
+                } else {
                     auto res = cli.Delete(("/delete?key=" + key).c_str());
-                    success = (res && res->status == 200);
+                    ok = res && res->status == 200;
                 }
                 break;
             }
         }
 
         auto end = steady_clock::now();
-        auto latency_ns = duration_cast<nanoseconds>(end - start).count();
+        long long ns = duration_cast<nanoseconds>(end - start).count();
 
-        if (success) {
-            local_count++;
-            local_latency += latency_ns;
+        if (ok) {
+            local_req++;
+            local_lat += ns;
         }
     }
 
-    total_requests += local_count;
-    total_latency_ns += local_latency;
+    total_req += local_req;
+    total_latency_ns += local_lat;
 }
 
-Workload parse_workload(const string &s) {
-    if (s == "putall") return PUT_ALL;
-    if (s == "getall") return GET_ALL;
-    if (s == "popular") return POPULAR_GET;
-    if (s == "mixed") return MIXED;
-
-    cerr << "Unknown workload: " << s << endl;
-    exit(1);
+string get_arg(int argc, char *argv[], const string &flag, const string &def = "") {
+    for (int i = 1; i < argc - 1; i++) {
+        if (string(argv[i]) == flag)
+            return string(argv[i+1]);
+    }
+    return def;
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 5) {
-        cout << "Usage: " << argv[0] <<
-            " <num_threads> <duration_sec> <workload> <server_host> [port=8080]\n";
-        cout << "Workloads: putall | getall | popular | mixed\n";
+    if (argc < 9) {
+        cout << "Usage:\n"
+             << "  ./loadgen --workload getpopular --threads 100 "
+             << "--duration 300 --host localhost --port 8080\n";
         return 1;
     }
 
-    int num_threads = stoi(argv[1]);
-    int duration_sec = stoi(argv[2]);
-    Workload workload = parse_workload(argv[3]);
-    string server_host = argv[4];
-    int server_port = (argc >= 6 ? stoi(argv[5]) : 8080);
+    string workload_str = get_arg(argc, argv, "--workload");
+    string threads_str  = get_arg(argc, argv, "--threads");
+    string dur_str      = get_arg(argc, argv, "--duration");
+    string host         = get_arg(argc, argv, "--host", "localhost");
+    string port_str     = get_arg(argc, argv, "--port", "8080");
 
-    cout << "Load Generator Starting...\n";
-    cout << "Threads: " << num_threads << "\n";
-    cout << "Duration: " << duration_sec << " seconds\n";
-    cout << "Workload: " << argv[3] << "\n";
-    cout << "Server:   " << server_host << ":" << server_port << "\n";
-
-    atomic<long long> total_requests(0);
-    atomic<long long> total_latency_ns(0);
-
-    vector<thread> threads;
-
-    auto start_time = steady_clock::now();
-
-    for (int i = 0; i < num_threads; i++) {
-        threads.emplace_back(client_thread_func,
-                             i, workload, duration_sec,
-                             ref(total_requests), ref(total_latency_ns),
-                             ref(server_host), server_port);
+    if (workload_str.empty() || threads_str.empty() || dur_str.empty()) {
+        cerr << "Missing required arguments.\n";
+        return 1;
     }
 
-    for (auto &t : threads) t.join();
+    Workload workload = parse_workload(workload_str);
+    int threads = stoi(threads_str);
+    int duration = stoi(dur_str);
+    int port = stoi(port_str);
 
-    auto end_time = steady_clock::now();
-    double runtime = duration_cast<seconds>(end_time - start_time).count();
+    cout << "Loadgen starting...\n";
+    cout << "Workload: " << workload_str << "\nThreads: " << threads
+         << "\nDuration: " << duration << " sec\nHost: " << host
+         << "\nPort: " << port << "\n";
 
-    long long req = total_requests.load();
-    long long latency_ns = total_latency_ns.load();
+    atomic<long long> total_req(0);
+    atomic<long long> total_lat_ns(0);
 
-    int throughput = req / runtime;
-    double avg_latency_ms = (latency_ns / 1e6) / req;
+    vector<thread> pool;
+    auto start = steady_clock::now();
 
-    cout << "\n===== LOAD TEST RESULTS =====\n";
+    for (int i = 0; i < threads; i++) {
+        pool.emplace_back(perclientfunction, i, workload, duration,
+                          ref(total_req), ref(total_lat_ns), host, port);
+    }
+
+    for (auto &t : pool) t.join();
+
+    auto end = steady_clock::now();
+    double secs = duration_cast<seconds>(end - start).count();
+
+    long long req = total_req.load();
+    long long lat = total_lat_ns.load();
+
     cout << "Total Requests: " << req << "\n";
-    cout << "Throughput (req/sec): " << throughput << "\n";
-    cout << "Average Latency: " << avg_latency_ms << " ms\n";
-    cout << "=============================\n";
+    cout << "Throughput: " << (req / secs) << " req/s\n";
+    cout << "Avg Latency: " << (lat / 1e6) / req << " ms\n";
+    cout << "===================\n";
 
     return 0;
 }
